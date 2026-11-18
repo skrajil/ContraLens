@@ -73,101 +73,194 @@ function createChunks(text, chunkSize = 1000, overlap = 150) {
   return chunks;
 }
 
+async function generateWithFallback(fullPrompt, compactPrompt) {
+  // 1. Define your live fallback chain in priority order
+  const providers = [
+    {
+      name: 'gemini-3.8-flash',
+      run: async () => {
+        const res = await ai.models.generateContent({
+          model: 'gemini-3.8-flash',
+          contents: fullPrompt,
+        });
+        return res.text;
+      },
+    },
+    {
+      name: 'gemini-3.5-flash-lite',
+      run: async () => {
+        const res = await ai.models.generateContent({
+          model: 'gemini-3.5-flash-lite',
+          contents: fullPrompt,
+        });
+        return res.text;
+      },
+    },
+    // Cross-provider fallback 1: Groq (only runs if GROQ_API_KEY is in .env)
+    ...(process.env.GROQ_API_KEY
+      ? [
+          {
+            name: 'groq/gpt-oss-120b',
+            run: async () => {
+              const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+                },
+                body: JSON.stringify({
+                  model: 'openai/gpt-oss-120b',
+                  messages: [{ role: 'user', content: compactPrompt }], // Top 6 chunks to stay under 8K TPM
+                }),
+              });
+              if (!res.ok) throw new Error(`Groq HTTP ${res.status}`);
+              const data = await res.json();
+              return data.choices[0].message.content;
+            },
+          },
+        ]
+      : []),
+    // Cross-provider fallback 2: OpenRouter Free Router (only runs if OPENROUTER_API_KEY is in .env)
+    ...(process.env.OPENROUTER_API_KEY
+      ? [
+          {
+            name: 'openrouter/free',
+            run: async () => {
+              const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                },
+                body: JSON.stringify({
+                  model: 'openrouter/free',
+                  messages: [{ role: 'user', content: fullPrompt }],
+                }),
+              });
+              if (!res.ok) throw new Error(`OpenRouter HTTP ${res.status}`);
+              const data = await res.json();
+              return data.choices[0].message.content;
+            },
+          },
+        ]
+      : []),
+  ];
+
+  // 2. Cascade through providers until one succeeds
+  for (const provider of providers) {
+    try {
+      console.log(`⚡ Trying model: ${provider.name}...`);
+      const text = await provider.run();
+      if (text) {
+        console.log(`✅ Answered by: ${provider.name}`);
+        return { text, modelUsed: provider.name };
+      }
+    } catch (err) {
+      console.warn(`⚠️ ${provider.name} failed (${err.status || err.message}). Falling back...`);
+    }
+  }
+
+  throw new Error('All live AI providers in the fallback chain are currently unavailable.');
+}
+
 // Document Upload, Embedding & Dual-Database Persistence Endpoint
 app.post('/api/documents/upload', upload.single('document'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded.' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
-    console.log('Processing file:', req.file.originalname);
-
-    // 1. Extract text from PDF buffer
     const pdfData = await pdf(req.file.buffer);
     const extractedText = pdfData.text.trim();
+    const chunks = createChunks(extractedText, 1000, 150); // Keep your high accuracy chunks!
 
-    if (extractedText.length < 50) {
-      return res.status(422).json({
-        error: 'No readable text found. Please upload a text-based PDF.'
-      });
-    }
-
-    // 2. Chop text into overlapping chunks
-    const chunks = createChunks(extractedText, 1000, 150);
-    console.log(`Document split into ${chunks.length} chunks. Generating embeddings...`);
-
-    // 3. Generate 768-dimension Vector Embeddings using Gemini
-    const chunkData = await Promise.all(
-      chunks.map(async (chunk, index) => {
-        const response = await ai.models.embedContent({
-          model: 'gemini-embedding-001',
-          contents: chunk,
-          config: { outputDimensionality: 768 }
-        });
-
-        return {
-          chunkIndex: index,
-          text: chunk,
-          embedding: response.embeddings[0].values
-        };
-      })
-    );
-
-    console.log(`✅ Generated embeddings for ${chunkData.length} chunks! Saving to databases...`);
-
-    // 4. Save Contract Metadata to Supabase (PostgreSQL)
+    // 1. Instantly save the document to Supabase as 'processing'
     const { data: docRecord, error: supabaseError } = await supabase
       .from('documents')
       .insert({
         file_name: req.file.originalname,
         page_count: pdfData.numpages,
-        chunk_count: chunkData.length,
-        status: 'embedded'
+        chunk_count: chunks.length,
+        status: 'processing' // <--- Note the status
       })
-      .select()
-      .single();
+      .select().single();
 
-    if (supabaseError) {
-      throw new Error(`Supabase Insert Error: ${supabaseError.message}`);
-    }
+    if (supabaseError) throw new Error(`Supabase Error: ${supabaseError.message}`);
 
-    // 5. Save Chunks + Vectors to Qdrant Cloud
-    const vectorDim = chunkData[0].embedding.length;
-    await ensureQdrantCollection(vectorDim);
-
-    const points = chunkData.map((item) => ({
-      id: crypto.randomUUID(),
-      vector: item.embedding,
-      payload: {
-        document_id: docRecord.id,
-        file_name: req.file.originalname,
-        chunk_index: item.chunkIndex,
-        text: item.text
-      }
-    }));
-
-    await qdrant.upsert(COLLECTION_NAME, {
-      wait: true,
-      points
-    });
-
-    console.log(`🎉 Saved Document ${docRecord.id} to Supabase & ${points.length} vectors to Qdrant!`);
-
-    // 6. Return full confirmation to React frontend
-    res.status(200).json({
-      message: 'PDF parsed, embedded, and saved to Supabase & Qdrant!',
+    // 2. INSTANTLY RESPOND TO THE USER (UX is saved! Takes 0.5 seconds)
+    res.status(202).json({
+      message: 'Upload successful! Processing in background...',
       documentId: docRecord.id,
-      fileName: req.file.originalname,
-      pageCount: pdfData.numpages,
-      chunkCount: chunkData.length,
-      embeddingDimensions: vectorDim,
-      preview: chunkData[0].text.substring(0, 200) + '...'
+      status: 'processing'
     });
+
+    // 3. ASYNCHRONOUS BACKGROUND PROCESS (Runs after response is sent)
+    // We wrap this in an async IIFE so it doesn't block the server
+    (async () => {
+      try {
+        console.log(`Starting background processing for ${chunks.length} chunks...`);
+        const chunkData = [];
+
+        // Process sequentially to perfectly respect Google's 100/minute free tier limit
+        for (let i = 0; i < chunks.length; i++) {
+          const response = await ai.models.embedContent({
+            model: 'gemini-embedding-001',
+            contents: chunks[i],
+            config: { outputDimensionality: 768 }
+          });
+
+          chunkData.push({
+            chunkIndex: i,
+            text: chunks[i],
+            embedding: response.embeddings[0].values
+          });
+
+          // 750ms delay ensures we never hit the 429 Rate Limit error
+          await new Promise(resolve => setTimeout(resolve, 750));
+        }
+
+        console.log(`Embeddings generated! Saving to Qdrant...`);
+
+        // 4. Save to Qdrant
+        await ensureQdrantCollection(768);
+        const points = chunkData.map((item) => ({
+          id: crypto.randomUUID(),
+          vector: item.embedding,
+          payload: {
+            document_id: docRecord.id,
+            file_name: req.file.originalname,
+            chunk_index: item.chunkIndex,
+            text: item.text
+          }
+        }));
+        await qdrant.upsert(COLLECTION_NAME, { wait: true, points });
+
+        // 5. Update Supabase to completed
+        await supabase
+          .from('documents')
+          .update({ status: 'completed' })
+          .eq('id', docRecord.id);
+
+        console.log(`🎉 Background processing complete for ${req.file.originalname}!`);
+      } catch (bgError) {
+        console.error('Background Processing Failed:', bgError);
+        await supabase.from('documents').update({ status: 'failed' }).eq('id', docRecord.id);
+      }
+    })();
 
   } catch (error) {
     console.error('Upload Error:', error);
-    res.status(500).json({ error: error.message || 'Failed to process the PDF document.' });
+    res.status(500).json({ error: error.message });
   }
+});
+
+app.get('/api/documents/status/:id', async (req, res) => {
+  const { data, error } = await supabase
+    .from('documents')
+    .select('status')
+    .eq('id', req.params.id)
+    .single();
+
+  if (error) return res.status(404).json({ error: 'Document not found' });
+  res.json({ status: data.status }); // Returns 'processing', 'completed', or 'failed'
 });
 
 // Semantic Search & Risk Analysis Endpoint
@@ -181,65 +274,89 @@ app.post('/api/documents/ask', async (req, res) => {
 
     console.log(`Analyzing Document [${documentId}] for question: "${question}"`);
 
-    // 1. Convert the user's question into a 768-dimension vector
+    // 1. Convert the user's question into a 768-dimension vector (KEEP gemini-embedding-001!)
     const queryResponse = await ai.models.embedContent({
       model: 'gemini-embedding-001',
       contents: question,
-      config: { outputDimensionality: 768 }
+      config: { outputDimensionality: 768 },
     });
     const queryVector = queryResponse.embeddings[0].values;
 
-    // 2. Search Qdrant for the Top 5 most relevant chunks from THIS specific document
+    // 2. Search Qdrant for the Top 15 most relevant chunks from THIS specific document
     const qdrantResponse = await qdrant.query(COLLECTION_NAME, {
-      vector: queryVector,
+      query: queryVector,
       filter: {
-        must: [{ key: 'document_id', match: { value: documentId } }]
+        must: [{ key: 'document_id', match: { value: documentId } }],
       },
-      limit: 5,
-      with_payload: true, 
+      limit: 10,
+      score_threshold: 0.50,
+      with_payload: true,
     });
 
     const searchResults = qdrantResponse.points || qdrantResponse;
 
     if (searchResults.length === 0) {
-      return res.json({ answer: "I couldn't find any relevant information in this document.", sources: [] });
+      return res.json({
+        answer: "I couldn't find any relevant information in this document.",
+        sources: [],
+      });
     }
 
-    // 3. Stitch the retrieved chunks together to create the "Context"
-    const contextText = searchResults
-      .map((hit, index) => `--- CHUNK ${index + 1} ---\n${hit.payload.text}`)
+    // 3. Build both full context (10 chunks) and compact context (6 chunks for Groq)
+    const fullContext = searchResults
+      .map((hit, index) => `--- CHUNK ${hit.payload.chunk_index ?? index + 1} ---\n${hit.payload.text}`)
       .join('\n\n');
 
-    // 4. Construct a strict prompt for Gemini 1.5 Flash
-    const prompt = `
-      You are ContraLens, an expert Legal AI Assistant. 
-      Answer the user's question based ONLY on the provided contract excerpts below. 
-      If the excerpts do not contain the answer, say "The provided document does not contain this information." Do not guess.
-      
-      CONTEXT:
-      ${contextText}
-      
-      QUESTION: ${question}
-    `;
+    const compactContext = searchResults
+      .slice(0, 6)
+      .map((hit, index) => `--- CHUNK ${hit.payload.chunk_index ?? index + 1} ---\n${hit.payload.text}`)
+      .join('\n\n');
 
-    // 5. Generate the Final Answer
-    const aiResponse = await ai.models.generateContent({
-      model: 'gemini-3.6-flash',
-      contents: prompt
+    // 4. Prompt builder with strict legal formatting rules
+    const buildPrompt = (context) => `
+You are an elite corporate legal analyst.
+Using ONLY the following document chunks, answer the user's question.
+If the answer is not contained in the chunks, you must reply exactly with: "The provided document does not contain this information."
+
+CRITICAL FORMATTING RULES:
+- ALWAYS format your answer using clear bullet points.
+- Be highly specific and cite the exact conditions or rules from the text.
+- Do not use markdown headers (##), only bold text and bullet points.
+
+Context Chunks:
+${context}
+
+Question: ${question}
+`;
+
+    // 5. Generate the Final Answer using the Multi-Model Fallback Chain
+    console.log(`Sending ${searchResults.length} chunks through fallback chain...`);
+    const { text: answerText, modelUsed } = await generateWithFallback(
+      buildPrompt(fullContext),
+      buildPrompt(compactContext)
+    );
+
+    // 6. Format and send the response back to React
+    const sources = searchResults.map((match) => ({
+      chunkIndex: match.payload.chunk_index,
+      score: match.score,
+    }));
+
+    res.json({
+      answer: answerText,
+      modelUsed,
+      sources,
     });
-
-    res.status(200).json({
-      answer: aiResponse.text,
-      // Return the chunks used so the frontend can highlight them for the user later
-      sources: searchResults.map(hit => ({
-        chunkIndex: hit.payload.chunk_index,
-        text: hit.payload.text
-      }))
-    });
-
   } catch (error) {
     console.error('Retrieval Error:', error);
-    res.status(500).json({ error: error.message || 'Failed to analyze the document.' });
+
+    if (error.status === 503 || error.status === 429) {
+      return res.status(503).json({
+        error: 'All free-tier AI models are currently busy. Please wait 15 seconds and click Send again.',
+      });
+    }
+
+    res.status(500).json({ error: 'Failed to query document' });
   }
 });
 
